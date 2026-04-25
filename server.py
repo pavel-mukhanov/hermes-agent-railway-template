@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import logging
 import os
 import re
 import secrets
@@ -28,12 +29,19 @@ ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("hermes-railway")
+
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 
 if not ADMIN_PASSWORD:
     ADMIN_PASSWORD = secrets.token_urlsafe(16)
-    print(f"Generated admin password: {ADMIN_PASSWORD}")
+    logger.warning("Generated admin password (ADMIN_PASSWORD was empty): %s", ADMIN_PASSWORD)
 
 HERMES_HOME = os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
 ENV_FILE_PATH = Path(HERMES_HOME) / ".env"
@@ -194,6 +202,25 @@ def normalize_model_env_vars(env_vars: dict[str, str]) -> dict[str, str]:
     return normalized
 
 
+def log_model_settings(env_vars: dict[str, str], context: str):
+    normalized = normalize_model_env_vars(env_vars)
+    logger.info(
+        "%s model configuration: HERMES_MODEL=%r, LLM_MODEL=%r",
+        context,
+        normalized.get("HERMES_MODEL", ""),
+        normalized.get("LLM_MODEL", ""),
+    )
+
+
+def count_configured_channels(env_vars: dict[str, str]) -> int:
+    configured = 0
+    for key in CHANNEL_KEYS.values():
+        val = env_vars.get(key, "")
+        if bool(val) and val.lower() not in ("false", "0", "no"):
+            configured += 1
+    return configured
+
+
 class BasicAuthBackend(AuthenticationBackend):
     async def authenticate(self, conn):
         if "Authorization" not in conn.headers:
@@ -236,13 +263,23 @@ class GatewayManager:
 
     async def start(self):
         if self.process and self.process.returncode is None:
+            logger.info("Gateway start requested but process is already running (pid=%s)", self.process.pid)
             return
         self.state = "starting"
+        logger.info("Starting Hermes gateway")
         try:
             env = os.environ.copy()
             env["HERMES_HOME"] = HERMES_HOME
             env_vars = normalize_model_env_vars(read_env_file(ENV_FILE_PATH))
             env.update(env_vars)
+            log_model_settings(env_vars, "Gateway start")
+            provider_count = sum(1 for key in PROVIDER_KEYS if env_vars.get(key))
+            channel_count = count_configured_channels(env_vars)
+            logger.info(
+                "Gateway start config summary: providers_configured=%d, channels_configured=%d",
+                provider_count,
+                channel_count,
+            )
 
             self.process = await asyncio.create_subprocess_exec(
                 "hermes", "gateway",
@@ -254,25 +291,32 @@ class GatewayManager:
             self.start_time = time.time()
             task = asyncio.create_task(self._read_output())
             self._read_tasks.append(task)
+            logger.info("Hermes gateway started (pid=%s)", self.process.pid)
         except Exception as e:
             self.state = "error"
             self.logs.append(f"Failed to start gateway: {e}")
+            logger.exception("Failed to start Hermes gateway")
 
     async def stop(self):
         if not self.process or self.process.returncode is not None:
             self.state = "stopped"
+            logger.info("Gateway stop requested but process is already stopped")
             return
         self.state = "stopping"
+        logger.info("Stopping Hermes gateway (pid=%s)", self.process.pid)
         self.process.terminate()
         try:
             await asyncio.wait_for(self.process.wait(), timeout=10)
         except asyncio.TimeoutError:
+            logger.warning("Gateway did not stop gracefully in time, killing process (pid=%s)", self.process.pid)
             self.process.kill()
             await self.process.wait()
         self.state = "stopped"
         self.start_time = None
+        logger.info("Hermes gateway stopped")
 
     async def restart(self):
+        logger.info("Restarting Hermes gateway")
         await self.stop()
         self.restart_count += 1
         await self.start()
@@ -291,6 +335,7 @@ class GatewayManager:
         if self.process and self.process.returncode is not None and self.state == "running":
             self.state = "error"
             self.logs.append(f"Gateway exited with code {self.process.returncode}")
+            logger.error("Gateway exited unexpectedly with code %s", self.process.returncode)
 
     def get_status(self) -> dict:
         pid = None
@@ -360,13 +405,22 @@ async def api_config_put(request: Request):
             # Persist only canonical model key.
             normalized.pop("LLM_MODEL", None)
             write_env_file(ENV_FILE_PATH, normalized)
+            provider_count = sum(1 for key in PROVIDER_KEYS if normalized.get(key))
+            channel_count = count_configured_channels(normalized)
+            log_model_settings(normalized, "Config save")
+            logger.info(
+                "Configuration saved: restart_requested=%s, providers_configured=%d, channels_configured=%d",
+                restart,
+                provider_count,
+                channel_count,
+            )
 
         if restart:
             asyncio.create_task(gateway.restart())
 
         return JSONResponse({"ok": True, "restarting": restart})
     except Exception as e:
-        print(f"Config save error: {type(e).__name__}: {e}")
+        logger.exception("Config save error: %s: %s", type(e).__name__, e)
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
@@ -405,6 +459,7 @@ async def api_gateway_start(request: Request):
     auth_err = require_auth(request)
     if auth_err:
         return auth_err
+    logger.info("API gateway start requested by user=%s", getattr(request.user, "display_name", "unknown"))
     asyncio.create_task(gateway.start())
     return JSONResponse({"ok": True})
 
@@ -413,6 +468,7 @@ async def api_gateway_stop(request: Request):
     auth_err = require_auth(request)
     if auth_err:
         return auth_err
+    logger.info("API gateway stop requested by user=%s", getattr(request.user, "display_name", "unknown"))
     asyncio.create_task(gateway.stop())
     return JSONResponse({"ok": True})
 
@@ -421,6 +477,7 @@ async def api_gateway_restart(request: Request):
     auth_err = require_auth(request)
     if auth_err:
         return auth_err
+    logger.info("API gateway restart requested by user=%s", getattr(request.user, "display_name", "unknown"))
     asyncio.create_task(gateway.restart())
     return JSONResponse({"ok": True})
 
@@ -503,6 +560,12 @@ async def api_pairing_approve(request: Request):
         "approved_at": time.time(),
     }
     _save_pairing_json(approved_path, approved)
+    logger.info(
+        "Pairing approved: platform=%s user_id=%s user_name=%r",
+        platform,
+        entry["user_id"],
+        entry.get("user_name", ""),
+    )
 
     return JSONResponse({"ok": True, "user_id": entry["user_id"], "user_name": entry.get("user_name", "")})
 
@@ -526,6 +589,7 @@ async def api_pairing_deny(request: Request):
     if code in pending:
         del pending[code]
         _save_pairing_json(pending_path, pending)
+        logger.info("Pairing denied: platform=%s code=%s", platform, code)
 
     return JSONResponse({"ok": True})
 
@@ -566,6 +630,7 @@ async def api_pairing_revoke(request: Request):
     if user_id in approved:
         del approved[user_id]
         _save_pairing_json(approved_path, approved)
+        logger.info("Pairing revoked: platform=%s user_id=%s", platform, user_id)
 
     return JSONResponse({"ok": True})
 
@@ -573,6 +638,15 @@ async def api_pairing_revoke(request: Request):
 async def auto_start_gateway():
     env_vars = read_env_file(ENV_FILE_PATH)
     has_provider = any(env_vars.get(key) for key in PROVIDER_KEYS)
+    log_model_settings(env_vars, "Service startup")
+    provider_count = sum(1 for key in PROVIDER_KEYS if env_vars.get(key))
+    channel_count = count_configured_channels(env_vars)
+    logger.info(
+        "Service startup config summary: providers_configured=%d, channels_configured=%d, auto_start_gateway=%s",
+        provider_count,
+        channel_count,
+        has_provider,
+    )
     if has_provider:
         asyncio.create_task(gateway.start())
 
@@ -612,6 +686,12 @@ if __name__ == "__main__":
     import uvicorn
 
     port = int(os.environ.get("PORT", "8080"))
+    logger.info(
+        "Starting Hermes Railway service: port=%s, hermes_home=%s, env_file=%s",
+        port,
+        HERMES_HOME,
+        ENV_FILE_PATH,
+    )
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
