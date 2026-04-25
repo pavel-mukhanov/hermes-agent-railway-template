@@ -68,6 +68,7 @@ if not ADMIN_PASSWORD:
 
 HERMES_HOME = os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
 ENV_FILE_PATH = Path(HERMES_HOME) / ".env"
+CONFIG_FILE_PATH = Path(HERMES_HOME) / "config.yaml"
 PAIRING_DIR = Path(HERMES_HOME) / "pairing"
 CODE_TTL_SECONDS = 3600
 
@@ -133,6 +134,15 @@ CHANNEL_KEYS = {
     "Mattermost": "MATTERMOST_TOKEN",
     "Matrix": "MATRIX_ACCESS_TOKEN",
 }
+MODEL_PROVIDER_KEYS = [
+    ("OPENROUTER_API_KEY", "openrouter"),
+    ("DEEPSEEK_API_KEY", "deepseek"),
+    ("DASHSCOPE_API_KEY", "alibaba"),
+    ("GLM_API_KEY", "zai"),
+    ("KIMI_API_KEY", "kimi-coding"),
+    ("MINIMAX_API_KEY", "minimax"),
+    ("HF_TOKEN", "huggingface"),
+]
 
 
 def read_env_file(path: Path) -> dict[str, str]:
@@ -228,10 +238,11 @@ def normalize_model_env_vars(env_vars: dict[str, str]) -> dict[str, str]:
 def log_model_settings(env_vars: dict[str, str], context: str):
     normalized = normalize_model_env_vars(env_vars)
     logger.info(
-        "%s model configuration: HERMES_MODEL=%r, LLM_MODEL=%r",
+        "%s model configuration: HERMES_MODEL=%r, LLM_MODEL=%r, config_yaml=%s",
         context,
         normalized.get("HERMES_MODEL", ""),
         normalized.get("LLM_MODEL", ""),
+        CONFIG_FILE_PATH,
     )
 
 
@@ -242,6 +253,131 @@ def count_configured_channels(env_vars: dict[str, str]) -> int:
         if bool(val) and val.lower() not in ("false", "0", "no"):
             configured += 1
     return configured
+
+
+def yaml_quote(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def infer_model_provider(env_vars: dict[str, str], model: str) -> str:
+    explicit_provider = (env_vars.get("HERMES_INFERENCE_PROVIDER") or "").strip()
+    if explicit_provider and explicit_provider != "auto":
+        return explicit_provider
+
+    configured = [provider for key, provider in MODEL_PROVIDER_KEYS if env_vars.get(key)]
+    if len(configured) == 1:
+        return configured[0]
+    if env_vars.get("OPENROUTER_API_KEY") and "/" in model:
+        return "openrouter"
+    return configured[0] if configured else "openrouter"
+
+
+def read_configured_model_from_config_file() -> str:
+    if not CONFIG_FILE_PATH.exists():
+        return ""
+
+    lines = CONFIG_FILE_PATH.read_text().splitlines()
+    in_model = False
+    for line in lines:
+        if line.strip() == "model:" and line == line.lstrip():
+            in_model = True
+            continue
+        if in_model and line == line.lstrip() and line.strip():
+            break
+        if in_model:
+            stripped = line.strip()
+            if stripped.startswith("default:"):
+                value = stripped.partition(":")[2].strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                    value = value[1:-1].replace("''", "'")
+                return value
+    return ""
+
+
+def render_model_config_block(env_vars: dict[str, str]) -> list[str]:
+    normalized = normalize_model_env_vars(env_vars)
+    model = normalized.get("HERMES_MODEL", "").strip()
+    if not model:
+        return []
+
+    provider = infer_model_provider(normalized, model)
+    return [
+        "model:",
+        f"  default: {yaml_quote(model)}",
+        f"  provider: {yaml_quote(provider)}",
+    ]
+
+
+def merge_model_config_block(existing_block: list[str], model_block: list[str]) -> list[str]:
+    replacements = {}
+    for line in model_block[1:]:
+        key = line.strip().partition(":")[0]
+        replacements[key] = line
+
+    output = ["model:"]
+    seen = set()
+    for line in existing_block:
+        stripped = line.strip()
+        key = stripped.partition(":")[0]
+        if key in replacements:
+            output.append(replacements[key])
+            seen.add(key)
+        else:
+            output.append(line)
+
+    insert_at = 1
+    for key in ("default", "provider"):
+        if key not in seen:
+            output.insert(insert_at, replacements[key])
+            insert_at += 1
+    return output
+
+
+def sync_model_config_file(env_vars: dict[str, str], context: str):
+    normalized = normalize_model_env_vars(env_vars)
+    if not normalized.get("HERMES_MODEL", "").strip():
+        configured_model = read_configured_model_from_config_file()
+        if configured_model:
+            normalized["HERMES_MODEL"] = configured_model
+            normalized["LLM_MODEL"] = configured_model
+
+    model_block = render_model_config_block(normalized)
+    if not model_block:
+        logger.warning("%s skipped config.yaml model sync: HERMES_MODEL is empty", context)
+        return
+
+    CONFIG_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    lines = CONFIG_FILE_PATH.read_text().splitlines() if CONFIG_FILE_PATH.exists() else []
+    output: list[str] = []
+    i = 0
+    replaced = False
+    while i < len(lines):
+        line = lines[i]
+        if line.strip() == "model:" and line == line.lstrip():
+            replaced = True
+            i += 1
+            existing_block = []
+            while i < len(lines) and (not lines[i].strip() or lines[i] != lines[i].lstrip()):
+                existing_block.append(lines[i])
+                i += 1
+            output.extend(merge_model_config_block(existing_block, model_block))
+            continue
+        output.append(line)
+        i += 1
+
+    if not replaced:
+        if output and output[-1].strip():
+            output.append("")
+        output.extend(model_block)
+
+    CONFIG_FILE_PATH.write_text("\n".join(output) + "\n")
+    logger.info(
+        "%s synced config.yaml model: default=%r, provider=%r, path=%s",
+        context,
+        normalized.get("HERMES_MODEL", ""),
+        infer_model_provider(normalized, normalized.get("HERMES_MODEL", "")),
+        CONFIG_FILE_PATH,
+    )
 
 
 class BasicAuthBackend(AuthenticationBackend):
@@ -294,6 +430,7 @@ class GatewayManager:
             env = os.environ.copy()
             env["HERMES_HOME"] = HERMES_HOME
             env_vars = normalize_model_env_vars(read_env_file(ENV_FILE_PATH))
+            sync_model_config_file(env_vars, "Gateway start")
             env.update(env_vars)
             log_model_settings(env_vars, "Gateway start")
             provider_count = sum(1 for key in PROVIDER_KEYS if env_vars.get(key))
@@ -428,6 +565,7 @@ async def api_config_put(request: Request):
             # Persist only canonical model key.
             normalized.pop("LLM_MODEL", None)
             write_env_file(ENV_FILE_PATH, normalized)
+            sync_model_config_file(normalized, "Config save")
             provider_count = sum(1 for key in PROVIDER_KEYS if normalized.get(key))
             channel_count = count_configured_channels(normalized)
             log_model_settings(normalized, "Config save")
@@ -661,6 +799,7 @@ async def api_pairing_revoke(request: Request):
 async def auto_start_gateway():
     env_vars = read_env_file(ENV_FILE_PATH)
     has_provider = any(env_vars.get(key) for key in PROVIDER_KEYS)
+    sync_model_config_file(env_vars, "Service startup")
     log_model_settings(env_vars, "Service startup")
     provider_count = sum(1 for key in PROVIDER_KEYS if env_vars.get(key))
     channel_count = count_configured_channels(env_vars)
