@@ -44,7 +44,7 @@ CODE_TTL_SECONDS = 3600
 # Each entry: (key, label, category, is_password)
 ENV_VAR_DEFS = [
     # Model
-    ("LLM_MODEL", "Model", "model", False),
+    ("HERMES_MODEL", "Model", "model", False),
     # Providers
     ("OPENROUTER_API_KEY", "OpenRouter API Key", "provider", True),
     ("DEEPSEEK_API_KEY", "DeepSeek API Key", "provider", True),
@@ -92,7 +92,7 @@ ENV_VAR_DEFS = [
 
 PASSWORD_KEYS = {key for key, _, _, is_pw in ENV_VAR_DEFS if is_pw}
 
-PROVIDER_KEYS = [key for key, _, cat, _ in ENV_VAR_DEFS if cat == "provider" and key != "LLM_MODEL"]
+PROVIDER_KEYS = [key for key, _, cat, _ in ENV_VAR_DEFS if cat == "provider"]
 CHANNEL_KEYS = {
     "Telegram": "TELEGRAM_BOT_TOKEN",
     "Discord": "DISCORD_BOT_TOKEN",
@@ -178,6 +178,22 @@ def merge_secrets(new_vars: dict[str, str], existing_vars: dict[str, str]) -> di
     return result
 
 
+def normalize_model_env_vars(env_vars: dict[str, str]) -> dict[str, str]:
+    """
+    Keep model env vars backward-compatible:
+    - New key: HERMES_MODEL
+    - Legacy key: LLM_MODEL
+    """
+    normalized = dict(env_vars)
+    hermes_model = (normalized.get("HERMES_MODEL") or "").strip()
+    legacy_model = (normalized.get("LLM_MODEL") or "").strip()
+    model = hermes_model or legacy_model
+    normalized["HERMES_MODEL"] = model
+    # Kept for compatibility with older clients reading /api/config.
+    normalized["LLM_MODEL"] = model
+    return normalized
+
+
 class BasicAuthBackend(AuthenticationBackend):
     async def authenticate(self, conn):
         if "Authorization" not in conn.headers:
@@ -225,7 +241,7 @@ class GatewayManager:
         try:
             env = os.environ.copy()
             env["HERMES_HOME"] = HERMES_HOME
-            env_vars = read_env_file(ENV_FILE_PATH)
+            env_vars = normalize_model_env_vars(read_env_file(ENV_FILE_PATH))
             env.update(env_vars)
 
             self.process = await asyncio.create_subprocess_exec(
@@ -311,7 +327,7 @@ async def api_config_get(request: Request):
     if auth_err:
         return auth_err
     async with config_lock:
-        env_vars = read_env_file(ENV_FILE_PATH)
+        env_vars = normalize_model_env_vars(read_env_file(ENV_FILE_PATH))
     defs = [
         {"key": key, "label": label, "category": cat, "password": is_pw}
         for key, label, cat, is_pw in ENV_VAR_DEFS
@@ -340,7 +356,10 @@ async def api_config_put(request: Request):
             for key, value in existing.items():
                 if key not in merged:
                     merged[key] = value
-            write_env_file(ENV_FILE_PATH, merged)
+            normalized = normalize_model_env_vars(merged)
+            # Persist only canonical model key.
+            normalized.pop("LLM_MODEL", None)
+            write_env_file(ENV_FILE_PATH, normalized)
 
         if restart:
             asyncio.create_task(gateway.restart())

@@ -60,7 +60,7 @@
             <div>
               <label class="block text-xs text-gray-500 mb-1">LLM Model</label>
               <input type="text" class="w-full bg-gray-100 border border-gray-300 dark:bg-gray-800 dark:border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-blue-500"
-                     :value="vars.LLM_MODEL || ''" @input="vars.LLM_MODEL = $event.target.value"
+                     :value="vars.HERMES_MODEL || vars.LLM_MODEL || ''" @input="vars.HERMES_MODEL = $event.target.value"
                      placeholder="anthropic/claude-opus-4.6">
               <p class="text-xs text-gray-400 mt-1">OpenRouter format: provider/model (e.g. anthropic/claude-opus-4.6, openai/gpt-4o, google/gemini-3-flash-preview)</p>
             </div>
