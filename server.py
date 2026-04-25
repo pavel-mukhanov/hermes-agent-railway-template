@@ -30,11 +30,34 @@ ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+LOG_BUFFER_LINES = int(os.environ.get("LOG_BUFFER_LINES", "1000"))
+SERVICE_LOGS: deque[str] = deque(maxlen=LOG_BUFFER_LINES)
+
+
+class RingBufferLogHandler(logging.Handler):
+    def __init__(self, buffer: deque[str]):
+        super().__init__()
+        self.buffer = buffer
+
+    def emit(self, record: logging.LogRecord):
+        try:
+            self.buffer.append(self.format(record))
+        except Exception:
+            self.handleError(record)
+
+
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    format=LOG_FORMAT,
 )
 logger = logging.getLogger("hermes-railway")
+logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+if not any(isinstance(h, RingBufferLogHandler) for h in logger.handlers):
+    ring_buffer_handler = RingBufferLogHandler(SERVICE_LOGS)
+    ring_buffer_handler.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+    ring_buffer_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    logger.addHandler(ring_buffer_handler)
 
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
@@ -253,10 +276,10 @@ def require_auth(request: Request):
 
 
 class GatewayManager:
-    def __init__(self):
+    def __init__(self, log_buffer: deque[str] | None = None):
         self.process: asyncio.subprocess.Process | None = None
         self.state = "stopped"
-        self.logs: deque[str] = deque(maxlen=500)
+        self.logs: deque[str] = log_buffer if log_buffer is not None else deque(maxlen=500)
         self.start_time: float | None = None
         self.restart_count = 0
         self._read_tasks: list[asyncio.Task] = []
@@ -352,7 +375,7 @@ class GatewayManager:
         }
 
 
-gateway = GatewayManager()
+gateway = GatewayManager(log_buffer=SERVICE_LOGS)
 config_lock = asyncio.Lock()
 
 
