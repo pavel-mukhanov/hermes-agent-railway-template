@@ -81,5 +81,30 @@ class ModelConfigSyncTests(unittest.TestCase):
             )
 
 
+class FileBrowserPathTests(unittest.TestCase):
+    def test_resolve_browser_path_allows_hidden_files_under_root(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir).resolve()
+            hidden_file = root / ".hermes" / ".env"
+            hidden_file.parent.mkdir()
+            hidden_file.write_text("HERMES_MODEL=test/model\n")
+
+            with patch.object(server, "FILE_BROWSER_ROOT", root):
+                self.assertEqual(server.resolve_browser_path(".hermes/.env"), hidden_file)
+
+    def test_resolve_browser_path_rejects_parent_escape(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir).resolve()
+            outside = root.parent / "outside-browser-test"
+            try:
+                outside.write_text("outside\n")
+                with patch.object(server, "FILE_BROWSER_ROOT", root):
+                    with self.assertRaises(ValueError):
+                        server.resolve_browser_path("../outside-browser-test")
+            finally:
+                if outside.exists():
+                    outside.unlink()
+
+
 if __name__ == "__main__":
     unittest.main()
