@@ -71,6 +71,8 @@ ENV_FILE_PATH = Path(HERMES_HOME) / ".env"
 CONFIG_FILE_PATH = Path(HERMES_HOME) / "config.yaml"
 PAIRING_DIR = Path(HERMES_HOME) / "pairing"
 CODE_TTL_SECONDS = 3600
+FILE_BROWSER_ROOT = Path(os.environ.get("FILE_BROWSER_ROOT", str(Path(HERMES_HOME).parent))).resolve()
+FILE_BROWSER_MAX_BYTES = int(os.environ.get("FILE_BROWSER_MAX_BYTES", str(1024 * 1024)))
 
 # Registry of known Hermes env vars exposed in the UI.
 # Each entry: (key, label, category, is_password)
@@ -380,6 +382,38 @@ def sync_model_config_file(env_vars: dict[str, str], context: str):
     )
 
 
+def resolve_browser_path(raw_path: str) -> Path:
+    relative = raw_path.strip().lstrip("/")
+    target = (FILE_BROWSER_ROOT / relative).resolve()
+    if target != FILE_BROWSER_ROOT and FILE_BROWSER_ROOT not in target.parents:
+        raise ValueError("Path is outside the file browser root")
+    return target
+
+
+def browser_relative_path(path: Path) -> str:
+    if path == FILE_BROWSER_ROOT:
+        return ""
+    return path.relative_to(FILE_BROWSER_ROOT).as_posix()
+
+
+def browser_entry_info(path: Path) -> dict:
+    stat = path.lstat()
+    is_dir = path.is_dir()
+    is_file = path.is_file()
+    resolved = path.resolve()
+    return {
+        "name": path.name,
+        "path": browser_relative_path(resolved) if resolved == FILE_BROWSER_ROOT or FILE_BROWSER_ROOT in resolved.parents else browser_relative_path(path),
+        "type": "directory" if is_dir else "file" if is_file else "other",
+        "is_dir": is_dir,
+        "is_file": is_file,
+        "is_symlink": path.is_symlink(),
+        "hidden": path.name.startswith("."),
+        "size": stat.st_size,
+        "mtime": stat.st_mtime,
+    }
+
+
 class BasicAuthBackend(AuthenticationBackend):
     async def authenticate(self, conn):
         if "Authorization" not in conn.headers:
@@ -616,6 +650,83 @@ async def api_logs(request: Request):
     return JSONResponse({"lines": list(gateway.logs)})
 
 
+async def api_browser_list(request: Request):
+    auth_err = require_auth(request)
+    if auth_err:
+        return auth_err
+
+    raw_path = request.query_params.get("path", "")
+    try:
+        target = resolve_browser_path(raw_path)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+    if not target.exists():
+        return JSONResponse({"error": "Path not found"}, status_code=404)
+    if not target.is_dir():
+        return JSONResponse({"error": "Path is not a directory"}, status_code=400)
+
+    entries = []
+    for child in target.iterdir():
+        try:
+            entries.append(browser_entry_info(child))
+        except OSError:
+            continue
+    entries.sort(key=lambda item: (not item["is_dir"], item["name"].lower()))
+
+    parent = None
+    if target != FILE_BROWSER_ROOT:
+        parent = browser_relative_path(target.parent.resolve())
+
+    return JSONResponse({
+        "root": str(FILE_BROWSER_ROOT),
+        "path": browser_relative_path(target),
+        "parent": parent,
+        "entries": entries,
+    })
+
+
+async def api_browser_file(request: Request):
+    auth_err = require_auth(request)
+    if auth_err:
+        return auth_err
+
+    raw_path = request.query_params.get("path", "")
+    try:
+        target = resolve_browser_path(raw_path)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+    if not target.exists():
+        return JSONResponse({"error": "File not found"}, status_code=404)
+    if not target.is_file():
+        return JSONResponse({"error": "Path is not a file"}, status_code=400)
+
+    stat = target.stat()
+    truncated = stat.st_size > FILE_BROWSER_MAX_BYTES
+    try:
+        with target.open("rb") as f:
+            raw = f.read(FILE_BROWSER_MAX_BYTES)
+        content = raw.decode("utf-8")
+        binary = False
+    except UnicodeDecodeError:
+        content = base64.b64encode(raw).decode("ascii")
+        binary = True
+    except OSError as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+    return JSONResponse({
+        "path": browser_relative_path(target.resolve()),
+        "name": target.name,
+        "size": stat.st_size,
+        "mtime": stat.st_mtime,
+        "truncated": truncated,
+        "max_bytes": FILE_BROWSER_MAX_BYTES,
+        "binary": binary,
+        "content": content,
+    })
+
+
 async def api_gateway_start(request: Request):
     auth_err = require_auth(request)
     if auth_err:
@@ -820,6 +931,8 @@ routes = [
     Route("/api/config", api_config_put, methods=["PUT"]),
     Route("/api/status", api_status),
     Route("/api/logs", api_logs),
+    Route("/api/browser", api_browser_list),
+    Route("/api/browser/file", api_browser_file),
     Route("/api/gateway/start", api_gateway_start, methods=["POST"]),
     Route("/api/gateway/stop", api_gateway_stop, methods=["POST"]),
     Route("/api/gateway/restart", api_gateway_restart, methods=["POST"]),
