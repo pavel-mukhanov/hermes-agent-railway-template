@@ -1,6 +1,8 @@
 import tempfile
 import unittest
 import os
+import zipfile
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
@@ -104,6 +106,24 @@ class FileBrowserPathTests(unittest.TestCase):
             finally:
                 if outside.exists():
                     outside.unlink()
+
+    def test_zip_directory_includes_hidden_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir).resolve()
+            folder = root / "export"
+            folder.mkdir()
+            (folder / "visible.txt").write_text("visible\n")
+            (folder / ".hidden").write_text("hidden\n")
+
+            with patch.object(server, "FILE_BROWSER_ROOT", root):
+                data = server.build_browser_zip(folder)
+
+            with zipfile.ZipFile(BytesIO(data)) as archive:
+                self.assertEqual(
+                    sorted(archive.namelist()),
+                    ["export/.hidden", "export/visible.txt"],
+                )
+                self.assertEqual(archive.read("export/.hidden"), b"hidden\n")
 
 
 if __name__ == "__main__":

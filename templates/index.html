@@ -462,9 +462,14 @@
               <h2 class="text-lg font-semibold">File Browser</h2>
               <p class="text-xs text-gray-500 mt-1">Read-only view of files on the service. Hidden files and directories are included.</p>
             </div>
-            <button @click="loadBrowser(browser.path)" class="text-xs px-3 py-1.5 bg-gray-200 hover:bg-gray-300 dark:bg-gray-800 dark:hover:bg-gray-700 rounded-lg transition">
-              Refresh
-            </button>
+            <div class="flex gap-2">
+              <button @click="downloadBrowserZip()" class="text-xs px-3 py-1.5 bg-blue-100 text-blue-700 hover:bg-blue-200 dark:bg-blue-600/20 dark:text-blue-400 dark:hover:bg-blue-600/30 rounded-lg transition">
+                Download ZIP
+              </button>
+              <button @click="loadBrowser(browser.path)" class="text-xs px-3 py-1.5 bg-gray-200 hover:bg-gray-300 dark:bg-gray-800 dark:hover:bg-gray-700 rounded-lg transition">
+                Refresh
+              </button>
+            </div>
           </div>
 
           <div class="bg-white border border-gray-200 dark:bg-gray-900 dark:border-gray-800 rounded-xl p-4">
@@ -747,6 +752,12 @@
           } catch (e) {
             this.browser.error = 'File load failed: ' + e.message;
           }
+        },
+
+        downloadBrowserZip() {
+          const path = this.browser.path || '';
+          const url = '/api/browser/zip?path=' + encodeURIComponent(path);
+          window.location.href = url;
         },
 
         browserBreadcrumbs() {
