@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import io
 import json
 import logging
 import os
@@ -7,6 +8,7 @@ import re
 import secrets
 import signal
 import time
+import zipfile
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -21,7 +23,7 @@ from starlette.authentication import (
 from starlette.middleware import Middleware
 from starlette.middleware.authentication import AuthenticationMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse, PlainTextResponse
+from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route
 from starlette.templating import Jinja2Templates
 
@@ -414,6 +416,45 @@ def browser_entry_info(path: Path) -> dict:
     }
 
 
+def browser_zip_filename(path: Path) -> str:
+    name = path.name if path != FILE_BROWSER_ROOT else FILE_BROWSER_ROOT.name
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip(".-")
+    return f"{safe or 'files'}.zip"
+
+
+def build_browser_zip(path: Path) -> bytes:
+    buffer = io.BytesIO()
+    base_name = path.name if path != FILE_BROWSER_ROOT else FILE_BROWSER_ROOT.name or "root"
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for root, dirs, files in os.walk(path):
+            root_path = Path(root)
+            safe_dirs = []
+            for dirname in dirs:
+                dir_path = root_path / dirname
+                try:
+                    resolved = dir_path.resolve()
+                except OSError:
+                    continue
+                if resolved == FILE_BROWSER_ROOT or FILE_BROWSER_ROOT in resolved.parents:
+                    safe_dirs.append(dirname)
+            dirs[:] = safe_dirs
+
+            for filename in files:
+                file_path = root_path / filename
+                try:
+                    resolved = file_path.resolve()
+                except OSError:
+                    continue
+                if resolved != FILE_BROWSER_ROOT and FILE_BROWSER_ROOT not in resolved.parents:
+                    continue
+                if not file_path.is_file():
+                    continue
+                archive_name = Path(base_name) / file_path.relative_to(path)
+                archive.write(file_path, archive_name.as_posix())
+
+    return buffer.getvalue()
+
+
 class BasicAuthBackend(AuthenticationBackend):
     async def authenticate(self, conn):
         if "Authorization" not in conn.headers:
@@ -727,6 +768,40 @@ async def api_browser_file(request: Request):
     })
 
 
+async def api_browser_zip(request: Request):
+    auth_err = require_auth(request)
+    if auth_err:
+        return auth_err
+
+    raw_path = request.query_params.get("path", "")
+    try:
+        target = resolve_browser_path(raw_path)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+    if not target.exists():
+        return JSONResponse({"error": "Path not found"}, status_code=404)
+    if not target.is_dir():
+        return JSONResponse({"error": "Path is not a directory"}, status_code=400)
+
+    try:
+        archive = build_browser_zip(target)
+    except OSError as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+    quoted_name = browser_zip_filename(target)
+    logger.info(
+        "Browser ZIP download prepared: path=%s size=%d",
+        browser_relative_path(target),
+        len(archive),
+    )
+    return Response(
+        archive,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{quoted_name}"'},
+    )
+
+
 async def api_gateway_start(request: Request):
     auth_err = require_auth(request)
     if auth_err:
@@ -933,6 +1008,7 @@ routes = [
     Route("/api/logs", api_logs),
     Route("/api/browser", api_browser_list),
     Route("/api/browser/file", api_browser_file),
+    Route("/api/browser/zip", api_browser_zip),
     Route("/api/gateway/start", api_gateway_start, methods=["POST"]),
     Route("/api/gateway/stop", api_gateway_stop, methods=["POST"]),
     Route("/api/gateway/restart", api_gateway_restart, methods=["POST"]),
